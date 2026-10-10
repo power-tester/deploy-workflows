@@ -121,7 +121,7 @@ on:
 jobs:
   deploy:
     name: Deploy ${{ matrix.service }} to ${{ inputs.environment }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The ONLY job that declares the environment. The health check and summary
     # deliberately do not, so adding required reviewers gates the deploy alone
     # rather than every job in the chain.
@@ -143,7 +143,7 @@ jobs:
       # actions/checkout inside a reusable workflow checks out the CALLER's repository.
       - name: Checkout
         if: ${{ inputs.image_tag == '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.sha || github.ref }}
           fetch-depth: 0
@@ -226,7 +226,7 @@ jobs:
     # deploy alone rather than every job in the chain.
     name: Summary
     needs: deploy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ always() }}
     steps:
       - name: Write step summary
@@ -251,13 +251,13 @@ jobs:
   notify-pr:
     name: Notify PR
     needs: [deploy, summary]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # No environment: the URL comes from the deploy job's outputs, so this job needs
     # no environment-scoped variables and stays outside any approval gate.
     if: ${{ always() }}
     steps:
       - name: Comment deploy status on PR
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             // inputs.sha is set for staging/production (manual); fall back to context.sha for ci (push)
@@ -295,7 +295,7 @@ jobs:
             }
 
       - name: Label PR with deployed environment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         if: ${{ needs.deploy.result == 'success' }}
         env:
           LABEL_COLORS: ${{ inputs.label_colors }}
