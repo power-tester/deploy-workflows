@@ -1,0 +1,165 @@
+name: Railway deploy
+description: >
+  Deploy one service to Railway, either from source or from a pre-built container image.
+
+# Naming conventions. Every one has a default, so a caller that follows them needs
+# to set nothing; a repository that differs overrides only what actually differs.
+#
+#   Railway service name : <project>-<service>-<railway_env>
+#   Container image      : <registry>/<owner>/<project>-<service>:<image_tag>
+#   Dockerfile path      : packages/<service>/Dockerfile
+#
+# <project> defaults to the CALLING repository's name (github.repository).
+#
+# There is no `sha` input by design. When image_tag is blank this action deploys
+# whatever is in the current working directory, so the CALLER is responsible for
+# checking out the commit it wants built (see actions/checkout in deploy.yml).
+# When image_tag is set the working directory is ignored entirely — which is why
+# the callers treat `sha` and `image_tag` as mutually exclusive.
+
+inputs:
+  service:
+    description: Service short name (e.g. server, client). Drives the default service name, image name and Dockerfile path.
+    required: true
+  railway_env:
+    description: Railway environment name to deploy into (ci | dev | staging | production).
+    required: true
+  image_tag:
+    description: |
+      Normalized image tag (e.g. sha-abc1234) produced by build-image.yml.
+      Already undecorated by resolve-deploy-inputs — do NOT re-parse display forms here.
+      When set, Railway deploys from the pre-built image; blank means build from source.
+    required: false
+    default: ''
+  railway_token:
+    description: Railway project token (Settings → Tokens in the Railway dashboard).
+    required: true
+
+  # --- Naming, all optional. Blank means "derive the current convention". ---
+  project_slug:
+    description: Project prefix for service and image names. Defaults to the repository name.
+    required: false
+    default: ''
+  registry:
+    description: Container registry hosting the pre-built images.
+    required: false
+    default: ghcr.io
+  image_name:
+    description: Full image name without registry, owner or tag. Defaults to <project>-<service>.
+    required: false
+    default: ''
+  service_name:
+    description: Railway service to deploy into. Defaults to <project>-<service>-<railway_env>.
+    required: false
+    default: ''
+  dockerfile_path:
+    description: |
+      Dockerfile path Railway is configured to build, relative to the upload root.
+      The pre-built-image path recreates this exact path in a temp context so Railway
+      pulls the image instead of building. Defaults to packages/<service>/Dockerfile.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # Access preflight. Separates "the credential is wrong" from "the deploy itself
+    # failed" — without it an auth failure surfaces only as a bare Railway error
+    # after ~10s of npm output, indistinguishable from a deploy problem.
+    - name: Check Railway access (${{ inputs.service }})
+      shell: bash
+      env:
+        RAILWAY_TOKEN: ${{ inputs.railway_token }}
+        SERVICE: ${{ inputs.service }}
+        # NOT "RAILWAY_ENV" — see the warning on the deploy step below.
+        DEPLOY_ENV: ${{ inputs.railway_env }}
+        PROJECT_SLUG: ${{ inputs.project_slug }}
+        SERVICE_NAME: ${{ inputs.service_name }}
+      run: |
+        # A missing secret is a hard failure: it means the token never reached this
+        # action, which is a wiring bug rather than a credential problem.
+        if [ -z "${RAILWAY_TOKEN:-}" ]; then
+          echo "::error::RAILWAY_TOKEN is empty — the secret did not reach this action."
+          echo "Check that the calling job declares the right 'environment:' and that"
+          echo "RAILWAY_TOKEN is set on that GitHub Environment."
+          exit 1
+        fi
+        PROJECT="${PROJECT_SLUG:-${GITHUB_REPOSITORY##*/}}"
+        TARGET="${SERVICE_NAME:-${PROJECT}-${SERVICE}-${DEPLOY_ENV}}"
+        echo "Expecting service '${TARGET}' in Railway environment '${DEPLOY_ENV}'."
+
+        # `railway status` resolves the token to a workspace/project/environment and
+        # lists the services it can see. Do NOT add `railway whoami`: project tokens
+        # are not tied to a user account, so it reports "Unauthorized" for tokens that
+        # deploy perfectly well, in wording almost identical to a real auth failure.
+        if ! STATUS=$(npx --yes @railway/cli@latest status 2>&1); then
+          echo "$STATUS" | sed 's/^/  /'
+          echo "::error::railway status failed for environment '${DEPLOY_ENV}'."
+          echo "Check the token in Railway -> Project Settings -> Tokens, and confirm"
+          echo "no RAILWAY_* variable is overriding the CLI's target backend."
+          exit 1
+        fi
+        echo "$STATUS" | sed 's/^/  /'
+
+        # Catches a renamed or deleted service before the deploy reports it obliquely.
+        if ! printf '%s' "$STATUS" | grep -qF "$TARGET"; then
+          echo "::warning::Service '${TARGET}' was not listed by railway status —"
+          echo "it may have been renamed or removed in the '${DEPLOY_ENV}' environment."
+        fi
+
+    # Deployment mode:
+    #   image_tag set   → deploy a pre-built image. A temp directory containing a
+    #                     minimal FROM-only Dockerfile at the configured path is
+    #                     created so Railway pulls the image rather than building.
+    #   image_tag blank → Railway builds the image itself from the working directory.
+    - name: Deploy ${{ inputs.service }} to Railway
+      shell: bash
+      env:
+        RAILWAY_TOKEN: ${{ inputs.railway_token }}
+        # Pass user-controlled values via env: so they are never interpolated
+        # directly into the shell script — prevents quote-breaking and command injection.
+        IMAGE_TAG: ${{ inputs.image_tag }}
+        SERVICE: ${{ inputs.service }}
+        # WARNING: this MUST NOT be named RAILWAY_ENV. The Railway CLI reserves that
+        # variable to select which Railway BACKEND to talk to, so RAILWAY_ENV=staging
+        # pointed the CLI at Railway's own staging API, where our token does not
+        # exist — every staging deploy failed with "Invalid RAILWAY_TOKEN" while the
+        # credential was provably valid. Values like "ci"/"production"/"dev" are not
+        # recognised backends and fell through to the default, which is the only
+        # reason those environments kept working.
+        DEPLOY_ENV: ${{ inputs.railway_env }}
+        REPO_OWNER: ${{ github.repository_owner }}
+        PROJECT_SLUG: ${{ inputs.project_slug }}
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE_NAME: ${{ inputs.image_name }}
+        SERVICE_NAME: ${{ inputs.service_name }}
+        DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+      run: |
+        OWNER=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+        PROJECT="${PROJECT_SLUG:-${GITHUB_REPOSITORY##*/}}"
+        TARGET="${SERVICE_NAME:-${PROJECT}-${SERVICE}-${DEPLOY_ENV}}"
+        IMAGE_BASE="${IMAGE_NAME:-${PROJECT}-${SERVICE}}"
+        DOCKERFILE="${DOCKERFILE_PATH:-packages/${SERVICE}/Dockerfile}"
+
+        if [ -n "$IMAGE_TAG" ]; then
+          if ! printf '%s' "$IMAGE_TAG" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+            echo "Invalid image_tag '$IMAGE_TAG' (allowed: letters, numbers, ., _, -)"; exit 1
+          fi
+          IMAGE="${REGISTRY}/${OWNER}/${IMAGE_BASE}:${IMAGE_TAG}"
+          echo "Deploying pre-built image ${IMAGE} → ${DEPLOY_ENV}..."
+          DEPLOY_DIR=$(mktemp -d)
+          # Railway is configured with a specific Dockerfile path; the uploaded
+          # context must contain a file at that exact path.
+          mkdir -p "$DEPLOY_DIR/$(dirname "$DOCKERFILE")"
+          echo "FROM ${IMAGE}" > "$DEPLOY_DIR/${DOCKERFILE}"
+          cd "$DEPLOY_DIR"
+        else
+          echo "Deploying from source for ${TARGET} → ${DEPLOY_ENV}..."
+        fi
+        # --detach is intentionally omitted: railway up blocks until Railway confirms
+        # the new deployment is live, so the caller's health check is guaranteed to test
+        # the new instance rather than the still-running old one.
+        npx --yes @railway/cli@latest up \
+          --service "${TARGET}" \
+          --environment "$DEPLOY_ENV"
+        echo "${SERVICE} deploy complete."

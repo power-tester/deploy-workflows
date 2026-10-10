@@ -1,0 +1,134 @@
+name: Resolve deploy inputs
+description: >
+  Validate the raw workflow_dispatch deploy inputs and normalize them for deploy.yml.
+
+# This action is the BOUNDARY between the human-facing workflow_dispatch UI and the
+# deploy pipeline. build-image.yml decorates dropdown options for readability
+# (e.g. "sha-abc1234 (2026-06-07)") and adds a "(build from source)" sentinel;
+# this action is the ONE place that undecorates them. Everything downstream —
+# deploy.yml and railway-deploy — receives a clean tag, or the empty string
+# meaning "build from source", and must not re-parse the display form.
+#
+# It must run on the RAW dispatch inputs, before any fallback is applied: the
+# mutual-exclusion check below depends on telling "the user supplied a SHA" apart
+# from "we defaulted to HEAD", and that distinction is gone once `sha` is resolved.
+#
+# PRECONDITION: the calling job must already have run actions/checkout with
+# fetch-depth: 0. Resolving a short SHA from a sha-* tag needs full history of the
+# calling repository, and this action cannot know which ref the caller wants, so
+# the checkout cannot live inside it.
+
+inputs:
+  image_tag:
+    description: Raw image_tag dispatch input, possibly decorated ("latest", "(build from source)", "sha-abc1234 (2026-06-07)").
+    required: false
+    default: ''
+  sha:
+    description: Raw sha dispatch input as typed by the user. Empty means "not supplied".
+    required: false
+    default: ''
+  github_token:
+    description: >
+      Token used to read GHCR package metadata when resolving a moving tag such as
+      "latest" back to the commit its image was built from. Needs `packages: read`.
+    required: true
+  reference_package:
+    description: >
+      GHCR container package queried to map a moving tag onto its sha-* tag. Every
+      service image shares the same sha-* tags, so one package is enough. Defaults to
+      <repository name>-server; set it when the services are not named that way.
+    required: false
+    default: ''
+
+outputs:
+  sha:
+    description: Full 40-char commit SHA the deploy should be attributed to.
+    value: ${{ steps.resolve.outputs.sha }}
+  short_sha:
+    description: First 7 chars of `sha`, for release tags and PR comments.
+    value: ${{ steps.resolve.outputs.short_sha }}
+  image_tag:
+    description: Normalized image tag — decoration and sentinel removed. Empty means "build from source".
+    value: ${{ steps.resolve.outputs.image_tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate and resolve
+      id: resolve
+      shell: bash
+      env:
+        # Raw values via env: so they are never interpolated into the script text.
+        IMAGE_TAG_RAW: ${{ inputs.image_tag }}
+        SHA_RAW: ${{ inputs.sha }}
+        REFERENCE_PACKAGE: ${{ inputs.reference_package }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        PKG_OWNER: ${{ github.repository_owner }}
+      run: |
+        # ---- normalize ------------------------------------------------------
+        # Strip display date suffix: "sha-abc1234 (2026-06-06)" → "sha-abc1234"
+        IMAGE_TAG="${IMAGE_TAG_RAW% (*}"
+        # The dropdown sentinel means the same thing as leaving the field blank.
+        [ "$IMAGE_TAG" = "(build from source)" ] && IMAGE_TAG=""
+
+        # ---- validate -------------------------------------------------------
+        # A user-supplied sha and a real image_tag are mutually exclusive: sha pins
+        # the source checkout, but image_tag deploys a pre-built image and ignores
+        # the checked-out source entirely.
+        if [ -n "$SHA_RAW" ] && [ -n "$IMAGE_TAG" ]; then
+          echo "Error: both 'sha' and 'image_tag' were supplied."
+          echo "These inputs are mutually exclusive: 'sha' pins the source checkout,"
+          echo "but 'image_tag' deploys a pre-built image and ignores the source entirely."
+          echo "Supply one or the other, not both."
+          exit 1
+        fi
+
+        # ---- resolve --------------------------------------------------------
+        # If image_tag is a sha- tag, derive the commit from it so deploy summaries,
+        # PR notifications and the GitHub Release all point at the exact commit the
+        # image was built from.
+        SHORT_SHA_FROM_TAG=$(echo "$IMAGE_TAG" | sed -n 's/^sha-\([a-f0-9]*\).*/\1/p')
+        if [ -n "$SHORT_SHA_FROM_TAG" ]; then
+          SHA=$(git rev-parse --verify "${SHORT_SHA_FROM_TAG}^{commit}")
+        elif [ -n "$IMAGE_TAG" ]; then
+          # Moving tag (e.g. "latest"): it carries no commit of its own, so ask GHCR which
+          # sha-* tag shares the same image version and attribute the deploy to that commit.
+          #
+          # Falling back to HEAD here is WRONG. build-image.yml pushes a "[skip ci]" chore
+          # commit to main after every build, so HEAD is routinely a commit that was never
+          # built into an image and never went through a PR. Attributing the deploy to it
+          # makes listPullRequestsAssociatedWithCommit return nothing, which silently skips
+          # the PR comment and the "deployed: <env>" label, and tags the GitHub Release
+          # against the wrong commit.
+          OWNER=$(echo "$PKG_OWNER" | tr '[:upper:]' '[:lower:]')
+          # Every service image shares the same sha- tags, so one package is enough.
+          PACKAGE="${REFERENCE_PACKAGE:-${GITHUB_REPOSITORY##*/}-server}"
+          RAW=$(curl --fail-with-body -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/${OWNER}/packages/container/${PACKAGE}/versions?per_page=100") \
+            || RAW=""
+          MOVING_SHA_TAG=$(echo "$RAW" | jq -r --arg t "$IMAGE_TAG" '
+            [ .[]? | select(.metadata.container.tags | index($t))
+                   | .metadata.container.tags[] | select(startswith("sha-")) ]
+            | first // empty' 2>/dev/null)
+          if [ -z "$MOVING_SHA_TAG" ]; then
+            echo "Error: could not determine which commit image tag '${IMAGE_TAG}' points to."
+            echo "GHCR did not report a sha-* tag sharing a version with '${IMAGE_TAG}'."
+            echo "Re-run the deploy selecting an explicit sha-* image tag instead."
+            exit 1
+          fi
+          echo "Moving tag '${IMAGE_TAG}' resolves to image tag '${MOVING_SHA_TAG}'."
+          SHA=$(git rev-parse --verify "${MOVING_SHA_TAG#sha-}^{commit}")
+        elif [ -n "$SHA_RAW" ]; then
+          SHA=$(git rev-parse --verify "${SHA_RAW}^{commit}")
+        else
+          SHA=$(git rev-parse --verify "HEAD^{commit}")
+        fi
+
+        echo "Resolved: sha=$SHA image_tag=${IMAGE_TAG:-(build from source)}"
+        {
+          echo "sha=$SHA"
+          echo "short_sha=${SHA:0:7}"
+          echo "image_tag=$IMAGE_TAG"
+        } >> "$GITHUB_OUTPUT"

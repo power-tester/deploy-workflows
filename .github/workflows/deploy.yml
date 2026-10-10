@@ -1,0 +1,354 @@
+name: Deploy (reusable)
+
+# The single source of deploy logic, shared across repositories. Every
+# environment-specific deploy workflow in a product repository calls this one:
+#
+#   jobs:
+#     deploy-staging:
+#       uses: power-tester/deploy-workflows/.github/workflows/deploy.yml@v1
+#       with: { environment: staging, railway_env: staging }
+#       secrets: { RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }} }
+#
+# Hosting: Railway. Application secrets are the caller's business (dotenvx);
+# only RAILWAY_TOKEN is required here.
+#
+# `environment`, `vars` and `secrets` all resolve in the CALLING repository, so
+# each product keeps its own GitHub Environments, tokens and URLs.
+#
+# To switch hosting providers, only update this workflow and the actions it uses.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment name (dev | staging | production)
+        required: true
+        type: string
+      railway_env:
+        description: Railway environment name to deploy into (dev | staging | production)
+        required: true
+        type: string
+      image_tag:
+        description: |
+          Normalized pre-built image tag from GHCR (e.g. sha-abc1234), as produced by
+          build-image.yml and undecorated by the resolve-deploy-inputs action.
+          When set, Railway deploys from the pre-built image; blank means build from source.
+          Callers must pass a clean tag — display forms like "sha-abc1234 (2026-06-07)"
+          and the "(build from source)" sentinel are NOT accepted here.
+        required: false
+        type: string
+        default: ''
+      sha:
+        description: Full commit SHA to build from (only used when image_tag is blank or "(build from source)")
+        required: false
+        type: string
+        default: ''
+      # --- Reuse knobs. Every default reproduces this repo's current behaviour. ---
+      services:
+        description: |
+          JSON array of service short names to deploy, e.g. '["server","client"]' or '["app"]'.
+          One matrix leg per entry. Legs run one at a time to preserve the previous
+          sequential order; raise max-parallel below if the services are independent.
+        required: false
+        type: string
+        default: '["server","client"]'
+      project_slug:
+        description: Project prefix for Railway service and image names. Defaults to the repository name.
+        required: false
+        type: string
+        default: ''
+      service_names:
+        description: |
+          JSON map of service short name to the Railway service it deploys into,
+          e.g. '{"app":"app"}'. A service absent from the map follows the convention
+          <project>-<service>-<railway_env>. Set it when the Railway service was not
+          named by that convention, which is common for a single-service project.
+        required: false
+        type: string
+        default: '{}'
+      registry:
+        description: Container registry hosting the pre-built images.
+        required: false
+        type: string
+        default: ghcr.io
+      dockerfile_path_template:
+        description: |
+          Dockerfile path Railway is configured to build, with {0} standing in for the
+          service short name. Used to recreate that exact path in the temp context.
+        required: false
+        type: string
+        default: packages/{0}/Dockerfile
+      health_checks:
+        description: |
+          JSON map of service name to the path probed after that service deploys,
+          e.g. '{"server":"/health","client":"/"}'. A service absent from the map is
+          not health checked. Paths differ per service because a web front end rarely
+          serves the same endpoint as an API.
+        required: false
+        type: string
+        default: '{"server":"/health","client":"/"}'
+      health_urls:
+        description: |
+          JSON map of service name to base URL, overriding the convention below.
+          When a service is absent, its URL is read from the environment variable
+          <SERVICE>_URL — server -> SERVER_URL, client -> CLIENT_URL.
+        required: false
+        type: string
+        default: '{}'
+      max_parallel:
+        description: |
+          How many services deploy at once. 1 deploys them in series, which is the
+          safe default when one service depends on another being up. Raise it (or set
+          it to the number of services) when they are independent.
+        required: false
+        type: number
+        default: 1
+      app_url:
+        description: User-facing URL shown in the summary and PR comment. Defaults to the environment's CLIENT_URL variable.
+        required: false
+        type: string
+        default: ''
+      label_colors:
+        description: JSON map of environment name to PR label hex colour.
+        required: false
+        type: string
+        default: '{"ci":"0075ca","dev":"e4e669","staging":"0e8a16","production":"d93f0b"}'
+    secrets:
+      RAILWAY_TOKEN:
+        description: Railway project token (Settings → Tokens in Railway dashboard)
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ matrix.service }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # The ONLY job that declares the environment. The health check and summary
+    # deliberately do not, so adding required reviewers gates the deploy alone
+    # rather than every job in the chain.
+    environment: ${{ inputs.environment }}
+    strategy:
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix:
+        service: ${{ fromJSON(inputs.services) }}
+    outputs:
+      # Environment vars are only readable from a job that declares the environment,
+      # so resolve them here and hand them to the ungated jobs below. Every matrix
+      # leg writes the same value, so last-writer-wins is deterministic.
+      app_url: ${{ steps.urls.outputs.app_url }}
+
+    steps:
+      # Only a source build needs the caller's tree: railway-deploy uploads the
+      # working directory. A pre-built image deploy never reads the source (the
+      # action synthesizes a FROM-only context in a temp dir), so skip the checkout.
+      # actions/checkout inside a reusable workflow checks out the CALLER's repository.
+      - name: Checkout
+        if: ${{ inputs.image_tag == '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve environment URLs
+        id: urls
+        env:
+          # APP_URL suits a single-service project; CLIENT_URL a server/client split.
+          APP_URL: ${{ inputs.app_url || vars.APP_URL || vars.CLIENT_URL }}
+        run: |
+          echo "app_url=${APP_URL}" >> "$GITHUB_OUTPUT"
+
+      # The per-service deploy logic (source vs pre-built image) lives in the
+      # composite action so the services cannot drift apart. It is referenced by
+      # full path on purpose: a `./` path would resolve against the CALLER's checkout,
+      # which does not contain this repository's actions. `uses:` cannot take an
+      # expression, so the action is pinned to the same major tag callers pin the
+      # workflow to; the major version is the contract, see README "Releasing".
+      - name: Deploy ${{ matrix.service }} to Railway
+        uses: power-tester/deploy-workflows/.github/actions/railway-deploy@v1
+        with:
+          service: ${{ matrix.service }}
+          railway_env: ${{ inputs.railway_env }}
+          image_tag: ${{ inputs.image_tag }}
+          railway_token: ${{ secrets.RAILWAY_TOKEN }}
+          project_slug: ${{ inputs.project_slug }}
+          registry: ${{ inputs.registry }}
+          service_name: ${{ fromJSON(inputs.service_names)[matrix.service] || '' }}
+          dockerfile_path: ${{ format(inputs.dockerfile_path_template, matrix.service) }}
+
+      - name: Health check (${{ matrix.service }})
+        env:
+          SERVICE: ${{ matrix.service }}
+          HEALTH_CHECKS: ${{ inputs.health_checks }}
+          HEALTH_URLS: ${{ inputs.health_urls }}
+          # Serialising the whole context avoids dynamic vars[...] indexing and lets
+          # the URL be looked up by a name computed at runtime. Variables are not
+          # secrets, and the value is never printed.
+          ALL_VARS: ${{ toJSON(vars) }}
+        run: |
+          PROBE_PATH=$(printf '%s' "$HEALTH_CHECKS" | jq -r --arg s "$SERVICE" '.[$s] // empty')
+          if [ -z "$PROBE_PATH" ]; then
+            echo "No health check configured for '${SERVICE}' — skipping."
+            exit 0
+          fi
+
+          BASE=$(printf '%s' "$HEALTH_URLS" | jq -r --arg s "$SERVICE" '.[$s] // empty')
+          if [ -z "$BASE" ]; then
+            # Convention: service "server" -> SERVER_URL, "web-app" -> WEB_APP_URL.
+            VAR_NAME="$(printf '%s' "$SERVICE" | tr '[:lower:]-' '[:upper:]_')_URL"
+            BASE=$(printf '%s' "$ALL_VARS" | jq -r --arg k "$VAR_NAME" '.[$k] // empty')
+            [ -n "$BASE" ] && echo "Resolved URL for '${SERVICE}' from variable ${VAR_NAME}."
+          fi
+          if [ -z "$BASE" ]; then
+            echo "::warning::No URL for '${SERVICE}' (health_urls input or <SERVICE>_URL variable) — skipping its health check."
+            exit 0
+          fi
+
+          # railway up (without --detach) already confirmed the deployment is live.
+          # This is a final HTTP smoke test from the runner.
+          BASE="${BASE%/}"
+          DEADLINE=$(( $(date +%s) + 60 ))  # allow up to 1 minute for DNS/LB propagation
+          while true; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}${PROBE_PATH}" || echo "000")
+            echo "Health check ${BASE}${PROBE_PATH} → $STATUS ($(( DEADLINE - $(date +%s) ))s remaining)"
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ ${SERVICE} healthy."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::${SERVICE} health check timed out — last status: $STATUS"
+              exit 1
+            fi
+            sleep 5
+          done
+
+  summary:
+    # Once per deploy, not once per service. No environment declared: it reads the
+    # app URL from the deploy job's outputs, so adding required reviewers gates the
+    # deploy alone rather than every job in the chain.
+    name: Summary
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    steps:
+      - name: Write step summary
+        env:
+          APP_URL: ${{ needs.deploy.outputs.app_url }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          {
+            echo "## Deploy to ${{ inputs.environment }} — ${DEPLOY_RESULT}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Environment** | ${{ inputs.environment }} |"
+            echo "| **Railway env** | ${{ inputs.railway_env }} |"
+            echo "| **Services** | ${{ inputs.services }} |"
+            echo "| **Commit** | ${{ inputs.sha || github.sha }} |"
+            echo "| **Image tag** | ${{ inputs.image_tag || '(built from source)' }} |"
+            echo "| **Triggered by** | ${{ github.actor }} |"
+            echo "| **App URL** | ${APP_URL} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-pr:
+    name: Notify PR
+    needs: [deploy, summary]
+    runs-on: ubuntu-latest
+    # No environment: the URL comes from the deploy job's outputs, so this job needs
+    # no environment-scoped variables and stays outside any approval gate.
+    if: ${{ always() }}
+    steps:
+      - name: Comment deploy status on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // inputs.sha is set for staging/production (manual); fall back to context.sha for ci (push)
+            const sha = '${{ inputs.sha }}' || context.sha;
+            // Report the overall outcome: a green deploy with a failed health check
+            // is not a successful release.
+            // The health checks live inside the deploy job, so its result already
+            // reflects them.
+            const status = '${{ needs.deploy.result }}';
+            const emoji = status === 'success' ? '✅' : '❌';
+            const env = '${{ inputs.environment }}';
+            const body = `${emoji} **${env} deploy** ${status} for \`${sha.slice(0,7)}\`\n\nEnvironment: ${env} | [View app](${{ needs.deploy.outputs.app_url }})`;
+
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: sha,
+            });
+
+            // A deploy attributed to a commit with no associated PR is worth surfacing:
+            // it usually means the wrong commit was resolved, and the step would
+            // otherwise pass green having notified nobody.
+            if (prs.data.length === 0) {
+              core.warning(`No pull request is associated with ${sha.slice(0,7)} — no deploy comment posted.`);
+            }
+
+            for (const pr of prs.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body,
+              });
+              console.log(`Commented on PR #${pr.number}.`);
+            }
+
+      - name: Label PR with deployed environment
+        uses: actions/github-script@v7
+        if: ${{ needs.deploy.result == 'success' }}
+        env:
+          LABEL_COLORS: ${{ inputs.label_colors }}
+        with:
+          script: |
+            // inputs.sha is set for staging/production (manual); fall back to context.sha for ci (push)
+            const sha = '${{ inputs.sha }}' || context.sha;
+            const env = '${{ inputs.environment }}';
+
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: sha,
+            });
+
+            // Ensure the environment label exists with the correct color before applying it.
+            // Colors: ci=blue, dev=yellow, staging=green, production=red.
+            const labelColors = JSON.parse(process.env.LABEL_COLORS);
+            const labelName = `deployed: ${env}`;
+            const labelColor = labelColors[env] ?? 'ededed';
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: labelName,
+                color: labelColor,
+                description: `Deployed to ${env}`,
+              });
+            } catch (e) {
+              if (e.status === 422) {
+                // Label already exists — update it to ensure color and description stay in sync.
+                await github.rest.issues.updateLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: labelName,
+                  color: labelColor,
+                  description: `Deployed to ${env}`,
+                });
+              } else {
+                throw e;
+              }
+            }
+
+            if (prs.data.length === 0) {
+              core.warning(`No pull request is associated with ${sha.slice(0,7)} — "${labelName}" was not applied to any PR.`);
+            }
+
+            for (const pr of prs.data) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: [labelName],
+              });
+              console.log(`Applied "${labelName}" to PR #${pr.number}.`);
+            }
